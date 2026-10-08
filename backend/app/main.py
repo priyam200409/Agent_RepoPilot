@@ -1,7 +1,7 @@
-from urllib.parse import urlparse
-
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, field_validator
+
+from backend.app.github_loader import build_repository_snapshot
 
 
 app = FastAPI(title="RepoPilot API")
@@ -14,20 +14,9 @@ class AnalyzeRequest(BaseModel):
     @classmethod
     def validate_repository_url(cls, value: str) -> str:
         value = value.strip()
-        parsed = urlparse(value)
 
-        if (
-            parsed.scheme not in {"http", "https"}
-            or parsed.netloc != "github.com"
-        ):
-            raise ValueError("repository_url must be a valid GitHub URL")
-
-        parts = [part for part in parsed.path.split("/") if part]
-
-        if len(parts) != 2:
-            raise ValueError(
-                "repository_url must point to a GitHub repository"
-            )
+        if not value:
+            raise ValueError("repository_url cannot be empty")
 
         return value.rstrip("/")
 
@@ -39,7 +28,24 @@ def health_check():
 
 @app.post("/api/analyze")
 def analyze_repository(request: AnalyzeRequest):
+    try:
+        snapshot = build_repository_snapshot(request.repository_url)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     return {
-        "status": "accepted",
-        "repository_url": request.repository_url,
+        "status": "loaded",
+        "repository": {
+            "owner": snapshot.owner,
+            "name": snapshot.repository,
+            "default_branch": snapshot.default_branch,
+            "file_count": len(snapshot.files),
+        },
+        "files": [
+            {
+                "path": file.path,
+                "size": file.size,
+            }
+            for file in snapshot.files
+        ],
     }
