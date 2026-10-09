@@ -240,3 +240,70 @@ def test_engineering_reviewer_rejects_unsupported_evidence():
         ),
     ):
         review_engineering(supplied_evidence)
+
+
+def test_recruiter_reviewer_validates_groq_response():
+    import json
+    from unittest.mock import MagicMock, patch
+
+    from backend.app.reviewer import review_recruiter
+
+    supplied_evidence = [
+        {
+            "category": "documentation",
+            "metric": "readme_present",
+            "value": True,
+        }
+    ]
+
+    fake_response = {
+        "summary": "The repository includes a README.",
+        "findings": [
+            {
+                "id": "REC-001",
+                "category": "documentation",
+                "severity": "info",
+                "title": "README is present",
+                "explanation": (
+                    "A README is available to introduce the repository."
+                ),
+                "evidence": [
+                    {
+                        "category": "documentation",
+                        "metric": "readme_present",
+                        "value": True,
+                    }
+                ],
+                "recommendation": (
+                    "Ensure the README explains setup and project usage."
+                ),
+            }
+        ],
+    }
+
+    mock_client = MagicMock()
+    mock_client.chat.completions.create.return_value.choices = [
+        MagicMock(
+            message=MagicMock(content=json.dumps(fake_response))
+        )
+    ]
+
+    with (
+        patch(
+            "backend.app.reviewer.Groq",
+            return_value=mock_client,
+        ),
+        patch(
+            "backend.app.reviewer.get_groq_api_key",
+            return_value="test-key",
+        ),
+    ):
+        result = review_recruiter(supplied_evidence)
+
+    assert result.summary == "The repository includes a README."
+    assert len(result.findings) == 1
+    assert result.findings[0].id == "REC-001"
+
+    request = mock_client.chat.completions.create.call_args.kwargs
+    assert "recruiter" in request["messages"][0]["content"].lower()
+
