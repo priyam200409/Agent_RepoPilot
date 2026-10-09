@@ -7,6 +7,7 @@ from backend.app.github_loader import (
     RepositorySnapshot,
     build_repository_snapshot,
 )
+from backend.app.reviewer import review_engineering
 
 
 class AnalysisState(TypedDict):
@@ -31,7 +32,6 @@ def initialize_analysis(state: AnalysisState) -> dict:
 
 def load_repository(state: AnalysisState) -> dict:
     snapshot = build_repository_snapshot(state["repository_url"])
-
     return {
         "snapshot": snapshot,
         "status": "repository_loaded",
@@ -40,15 +40,20 @@ def load_repository(state: AnalysisState) -> dict:
 
 def analyze_evidence(state: AnalysisState) -> dict:
     snapshot = state["snapshot"]
-
     if snapshot is None:
         raise ValueError("Repository snapshot is required")
 
-    evidence = analyze_repository_evidence(snapshot)
-
     return {
-        "evidence": evidence,
+        "evidence": analyze_repository_evidence(snapshot),
         "status": "evidence_analyzed",
+    }
+
+
+def engineering_review(state: AnalysisState) -> dict:
+    review = review_engineering(state["evidence"])
+    return {
+        "findings": [finding.model_dump(mode="json") for finding in review.findings],
+        "status": "engineering_review_completed",
     }
 
 
@@ -58,11 +63,13 @@ def build_analysis_graph():
     graph.add_node("initialize_analysis", initialize_analysis)
     graph.add_node("load_repository", load_repository)
     graph.add_node("analyze_evidence", analyze_evidence)
+    graph.add_node("engineering_review", engineering_review)
 
     graph.add_edge(START, "initialize_analysis")
     graph.add_edge("initialize_analysis", "load_repository")
     graph.add_edge("load_repository", "analyze_evidence")
-    graph.add_edge("analyze_evidence", END)
+    graph.add_edge("analyze_evidence", "engineering_review")
+    graph.add_edge("engineering_review", END)
 
     return graph.compile()
 
