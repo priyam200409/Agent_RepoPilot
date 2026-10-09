@@ -1,4 +1,5 @@
 import pytest
+
 from pydantic import ValidationError
 
 from backend.app.schemas import (
@@ -120,3 +121,62 @@ def test_finding_rejects_unexpected_fields():
                 "invented_field": True,
             }
         )
+
+from unittest.mock import MagicMock, patch
+
+from backend.app.reviewer import review_engineering
+
+
+def test_engineering_reviewer_validates_groq_response():
+    evidence = [
+        {
+            "category": "repository",
+            "metric": "analyzable_file_count",
+            "value": 3,
+        }
+    ]
+
+    response = MagicMock()
+    response.choices[0].message.content = (
+        '{"summary":"Limited repository evidence.",'
+        '"findings":[{'
+        '"id":"ENG-001",'
+        '"category":"documentation",'
+        '"severity":"medium",'
+        '"title":"Limited documentation evidence",'
+        '"explanation":"The evidence set is small.",'
+        '"evidence":[{'
+        '"category":"repository",'
+        '"metric":"analyzable_file_count",'
+        '"value":3'
+        '}],'
+        '"recommendation":"Review the project documentation."'
+        '}]}'
+    )
+
+    with patch("backend.app.reviewer.get_groq_api_key", return_value="test-key"):
+        with patch("backend.app.reviewer.Groq") as groq:
+            groq.return_value.chat.completions.create.return_value = response
+
+            result = review_engineering(evidence)
+
+    assert result.summary == "Limited repository evidence."
+    assert result.findings[0].id == "ENG-001"
+    groq.return_value.chat.completions.create.assert_called_once()
+
+
+def test_engineering_reviewer_rejects_empty_evidence():
+    with pytest.raises(ValueError, match="Repository evidence is required"):
+        review_engineering([])
+
+
+def test_engineering_reviewer_rejects_invalid_response():
+    response = MagicMock()
+    response.choices[0].message.content = '{"summary":"Missing findings"}'
+
+    with patch("backend.app.reviewer.get_groq_api_key", return_value="test-key"):
+        with patch("backend.app.reviewer.Groq") as groq:
+            groq.return_value.chat.completions.create.return_value = response
+
+            with pytest.raises(ValueError, match="invalid engineering review"):
+                review_engineering([{"category": "repository", "metric": "file_count", "value": 3}])
