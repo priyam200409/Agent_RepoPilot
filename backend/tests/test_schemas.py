@@ -180,3 +180,63 @@ def test_engineering_reviewer_rejects_invalid_response():
 
             with pytest.raises(ValueError, match="invalid engineering review"):
                 review_engineering([{"category": "repository", "metric": "file_count", "value": 3}])
+
+
+def test_engineering_reviewer_rejects_unsupported_evidence():
+    import json
+
+    from unittest.mock import MagicMock, patch
+
+    import pytest
+
+    supplied_evidence = [
+        {
+            "category": "repository",
+            "metric": "file_count",
+            "value": 3,
+        }
+    ]
+
+    fake_response = {
+        "summary": "Repository review completed.",
+        "findings": [
+            {
+                "id": "ENG-001",
+                "category": "testing",
+                "severity": "medium",
+                "title": "Insufficient test coverage",
+                "explanation": "The repository may lack sufficient tests.",
+                "evidence": [
+                    {
+                        "category": "repository",
+                        "metric": "file_count",
+                        "value": 999,
+                    }
+                ],
+                "recommendation": "Add appropriate automated tests.",
+            }
+        ],
+    }
+
+    mock_client = MagicMock()
+    mock_client.chat.completions.create.return_value.choices = [
+        MagicMock(
+            message=MagicMock(content=json.dumps(fake_response))
+        )
+    ]
+
+    with (
+        patch(
+            "backend.app.reviewer.Groq",
+            return_value=mock_client,
+        ),
+        patch(
+            "backend.app.reviewer.get_groq_api_key",
+            return_value="test-key",
+        ),
+        pytest.raises(
+            ValueError,
+            match="unsupported evidence",
+        ),
+    ):
+        review_engineering(supplied_evidence)

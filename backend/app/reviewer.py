@@ -1,3 +1,4 @@
+
 import json
 
 from groq import Groq
@@ -8,6 +9,46 @@ from backend.app.schemas import ReviewResult
 
 
 MODEL = "llama-3.3-70b-versatile"
+
+
+def _evidence_key(item: dict) -> tuple[str, str, str]:
+    """Create a stable key for comparing evidence references."""
+    try:
+        return (
+            item["category"],
+            item["metric"],
+            json.dumps(
+                item["value"],
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("Invalid repository evidence format") from exc
+
+
+def _validate_evidence_grounding(
+    review: ReviewResult,
+    supplied_evidence: list[dict],
+) -> None:
+    """Reject findings that cite evidence absent from the supplied facts."""
+    supplied_keys = {
+        _evidence_key(item)
+        for item in supplied_evidence
+    }
+
+    for finding in review.findings:
+        for reference in finding.evidence:
+            reference_key = _evidence_key(
+                reference.model_dump()
+            )
+
+            if reference_key not in supplied_keys:
+                raise ValueError(
+                    "Groq returned an engineering review "
+                    "with unsupported evidence"
+                )
 
 
 def review_engineering(evidence: list[dict]) -> ReviewResult:
@@ -51,6 +92,12 @@ def review_engineering(evidence: list[dict]) -> ReviewResult:
         raise ValueError("Groq returned an empty engineering review")
 
     try:
-        return ReviewResult.model_validate_json(content)
+        review = ReviewResult.model_validate_json(content)
     except ValidationError as exc:
-        raise ValueError("Groq returned an invalid engineering review") from exc
+        raise ValueError(
+            "Groq returned an invalid engineering review"
+        ) from exc
+
+    _validate_evidence_grounding(review, evidence)
+
+    return review
