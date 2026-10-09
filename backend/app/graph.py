@@ -1,3 +1,4 @@
+
 from typing import TypedDict
 
 from langgraph.graph import END, START, StateGraph
@@ -7,7 +8,7 @@ from backend.app.github_loader import (
     RepositorySnapshot,
     build_repository_snapshot,
 )
-from backend.app.reviewer import review_engineering
+from backend.app.reviewer import review_engineering, review_recruiter
 
 
 class AnalysisState(TypedDict):
@@ -15,6 +16,7 @@ class AnalysisState(TypedDict):
     snapshot: RepositorySnapshot | None
     evidence: list[dict]
     findings: list[dict]
+    recruiter_findings: list[dict]
     scores: dict
     recommendations: list[str]
     status: str
@@ -25,6 +27,7 @@ def initialize_analysis(state: AnalysisState) -> dict:
         "status": "initializing",
         "evidence": [],
         "findings": [],
+        "recruiter_findings": [],
         "scores": {},
         "recommendations": [],
     }
@@ -52,8 +55,22 @@ def analyze_evidence(state: AnalysisState) -> dict:
 def engineering_review(state: AnalysisState) -> dict:
     review = review_engineering(state["evidence"])
     return {
-        "findings": [finding.model_dump(mode="json") for finding in review.findings],
+        "findings": [
+            finding.model_dump(mode="json")
+            for finding in review.findings
+        ],
         "status": "engineering_review_completed",
+    }
+
+
+def recruiter_review(state: AnalysisState) -> dict:
+    review = review_recruiter(state["evidence"])
+    return {
+        "recruiter_findings": [
+            finding.model_dump(mode="json")
+            for finding in review.findings
+        ],
+        "status": "recruiter_review_completed",
     }
 
 
@@ -64,12 +81,14 @@ def build_analysis_graph():
     graph.add_node("load_repository", load_repository)
     graph.add_node("analyze_evidence", analyze_evidence)
     graph.add_node("engineering_review", engineering_review)
+    graph.add_node("recruiter_review", recruiter_review)
 
     graph.add_edge(START, "initialize_analysis")
     graph.add_edge("initialize_analysis", "load_repository")
     graph.add_edge("load_repository", "analyze_evidence")
     graph.add_edge("analyze_evidence", "engineering_review")
-    graph.add_edge("engineering_review", END)
+    graph.add_edge("engineering_review", "recruiter_review")
+    graph.add_edge("recruiter_review", END)
 
     return graph.compile()
 
