@@ -64,7 +64,9 @@ def test_analysis_graph_runs_both_reviewers_and_scores(monkeypatch):
             }
         )
 
-    assert result["status"] == "recommendations_generated"
+    assert result["status"] == "completed"
+    assert result["report"]["status"] == "completed"
+    assert result["report"]["repository_name"] == "test-repo"
     assert result["snapshot"].repository == "test-repo"
     assert result["evidence"]
     assert result["findings"] == []

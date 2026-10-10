@@ -1,7 +1,8 @@
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, field_validator
 
-from backend.app.github_loader import build_repository_snapshot
+from backend.app.graph import RepositoryLoadError, analysis_graph
 
 
 app = FastAPI(title="RepoPilot API")
@@ -14,10 +15,8 @@ class AnalyzeRequest(BaseModel):
     @classmethod
     def validate_repository_url(cls, value: str) -> str:
         value = value.strip()
-
         if not value:
             raise ValueError("repository_url cannot be empty")
-
         return value.rstrip("/")
 
 
@@ -29,23 +28,10 @@ def health_check():
 @app.post("/api/analyze")
 def analyze_repository(request: AnalyzeRequest):
     try:
-        snapshot = build_repository_snapshot(request.repository_url)
-    except ValueError as exc:
+        result = analysis_graph.invoke({
+            "repository_url": request.repository_url,
+        })
+    except RepositoryLoadError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    return {
-        "status": "loaded",
-        "repository": {
-            "owner": snapshot.owner,
-            "name": snapshot.repository,
-            "default_branch": snapshot.default_branch,
-            "file_count": len(snapshot.files),
-        },
-        "files": [
-            {
-                "path": file.path,
-                "size": file.size,
-            }
-            for file in snapshot.files
-        ],
-    }
+    return result["report"]
