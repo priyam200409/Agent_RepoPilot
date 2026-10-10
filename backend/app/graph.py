@@ -9,7 +9,7 @@ from backend.app.github_loader import (
     build_repository_snapshot,
 )
 from backend.app.reviewer import review_engineering, review_recruiter
-from backend.app.schemas import ReviewScores, ScoreComponent
+from backend.app.schemas import Priority, ReviewScores, ScoreComponent
 
 
 class AnalysisState(TypedDict):
@@ -19,7 +19,7 @@ class AnalysisState(TypedDict):
     findings: list[dict]
     recruiter_findings: list[dict]
     scores: dict
-    recommendations: list[str]
+    recommendations: list[dict]
     status: str
 
 
@@ -44,6 +44,7 @@ def load_repository(state: AnalysisState) -> dict:
 
 def analyze_evidence(state: AnalysisState) -> dict:
     snapshot = state["snapshot"]
+
     if snapshot is None:
         raise ValueError("Repository snapshot is required")
 
@@ -55,6 +56,7 @@ def analyze_evidence(state: AnalysisState) -> dict:
 
 def engineering_review(state: AnalysisState) -> dict:
     review = review_engineering(state["evidence"])
+
     return {
         "findings": [
             finding.model_dump(mode="json")
@@ -66,6 +68,7 @@ def engineering_review(state: AnalysisState) -> dict:
 
 def recruiter_review(state: AnalysisState) -> dict:
     review = review_recruiter(state["evidence"])
+
     return {
         "recruiter_findings": [
             finding.model_dump(mode="json")
@@ -104,25 +107,34 @@ def _build_review_scores(
 ) -> ReviewScores:
     components: dict[str, ScoreComponent] = {}
 
-    for name, (weight, met, positive_reason, missing_reason) in (
-        criteria.items()
-    ):
+    for name, (
+        weight,
+        met,
+        positive_reason,
+        missing_reason,
+    ) in criteria.items():
         points = weight if met else 0
         reason = positive_reason if met else missing_reason
 
         components[name] = ScoreComponent(
             score=points,
-            rationale=f"{reason} Earned {points} of {weight} possible points.",
+            rationale=(
+                f"{reason} Earned {points} of {weight} possible points."
+            ),
         )
 
     return ReviewScores(
-        overall=sum(component.score for component in components.values()),
+        overall=sum(
+            component.score for component in components.values()
+        ),
         components=components,
     )
 
 
-def calculate_repository_scores(evidence: list[dict]) -> dict[str, ReviewScores]:
-    """Calculate reproducible scores from deterministic repository evidence."""
+def calculate_repository_scores(
+    evidence: list[dict],
+) -> dict[str, ReviewScores]:
+    """Calculate reproducible scores from repository evidence."""
     file_count = next(
         (
             item.get("value", 0)
@@ -136,18 +148,25 @@ def calculate_repository_scores(evidence: list[dict]) -> dict[str, ReviewScores]
     has_tests = _has_metric(evidence, "testing", "test_file")
     has_ci = _has_metric(evidence, "ci_cd", "configuration_file")
     has_dependencies = _has_metric(
-        evidence, "dependencies", "dependency_file"
+        evidence,
+        "dependencies",
+        "dependency_file",
     )
     has_container = _has_metric(
-        evidence, "containerization", "configuration_file"
+        evidence,
+        "containerization",
+        "configuration_file",
     )
     has_readme = _has_documentation(evidence, "README.md")
     has_additional_docs = (
         _has_documentation(evidence, "CONTRIBUTING.md")
         or _has_documentation(evidence, "CHANGELOG.md")
     )
+
     has_organized_repository = (
-        isinstance(file_count, int) and file_count >= 5
+        isinstance(file_count, int)
+        and not isinstance(file_count, bool)
+        and file_count >= 5
     )
 
     engineering = _build_review_scores(
@@ -244,6 +263,69 @@ def calculate_scores(state: AnalysisState) -> dict:
     }
 
 
+def generate_recommendations(
+    engineering_findings: list[dict],
+    recruiter_findings: list[dict],
+) -> list[dict]:
+    """Build prioritized recommendations from validated review findings."""
+    priority_by_severity = {
+        "critical": Priority.HIGH,
+        "high": Priority.HIGH,
+        "medium": Priority.MEDIUM,
+        "low": Priority.LOW,
+        "info": Priority.LOW,
+    }
+
+    recommendations = []
+    all_findings = [
+        *engineering_findings,
+        *recruiter_findings,
+    ]
+
+    for index, finding in enumerate(all_findings, start=1):
+        severity = str(finding["severity"]).lower()
+
+        if severity not in priority_by_severity:
+            raise ValueError(
+                f"Unsupported finding severity: {severity}"
+            )
+
+        recommendations.append(
+            {
+                "id": f"REC-{index:03d}",
+                "priority": priority_by_severity[severity].value,
+                "title": finding["title"],
+                "action": finding["recommendation"],
+                "rationale": finding["explanation"],
+                "finding_ids": [finding["id"]],
+            }
+        )
+
+    priority_rank = {
+        Priority.HIGH.value: 0,
+        Priority.MEDIUM.value: 1,
+        Priority.LOW.value: 2,
+    }
+
+    recommendations.sort(
+        key=lambda item: priority_rank[item["priority"]]
+    )
+
+    return recommendations
+
+
+def build_recommendations(state: AnalysisState) -> dict:
+    recommendations = generate_recommendations(
+        state["findings"],
+        state["recruiter_findings"],
+    )
+
+    return {
+        "recommendations": recommendations,
+        "status": "recommendations_generated",
+    }
+
+
 def build_analysis_graph():
     graph = StateGraph(AnalysisState)
 
@@ -253,6 +335,7 @@ def build_analysis_graph():
     graph.add_node("engineering_review", engineering_review)
     graph.add_node("recruiter_review", recruiter_review)
     graph.add_node("calculate_scores", calculate_scores)
+    graph.add_node("build_recommendations", build_recommendations)
 
     graph.add_edge(START, "initialize_analysis")
     graph.add_edge("initialize_analysis", "load_repository")
@@ -260,7 +343,8 @@ def build_analysis_graph():
     graph.add_edge("analyze_evidence", "engineering_review")
     graph.add_edge("engineering_review", "recruiter_review")
     graph.add_edge("recruiter_review", "calculate_scores")
-    graph.add_edge("calculate_scores", END)
+    graph.add_edge("calculate_scores", "build_recommendations")
+    graph.add_edge("build_recommendations", END)
 
     return graph.compile()
 

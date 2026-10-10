@@ -1,9 +1,12 @@
 
 from unittest.mock import patch
 
+import pytest
+
 from backend.app.graph import (
     analysis_graph,
     calculate_repository_scores,
+    generate_recommendations,
 )
 from backend.app.schemas import ReviewResult
 
@@ -61,11 +64,12 @@ def test_analysis_graph_runs_both_reviewers_and_scores(monkeypatch):
             }
         )
 
-    assert result["status"] == "scoring_completed"
+    assert result["status"] == "recommendations_generated"
     assert result["snapshot"].repository == "test-repo"
     assert result["evidence"]
     assert result["findings"] == []
     assert result["recruiter_findings"] == []
+    assert result["recommendations"] == []
 
     mock_engineering.assert_called_once_with(result["evidence"])
     mock_recruiter.assert_called_once_with(result["evidence"])
@@ -73,8 +77,9 @@ def test_analysis_graph_runs_both_reviewers_and_scores(monkeypatch):
     scores = result["scores"]
     assert scores["engineering"]["overall"] == 0
     assert scores["recruiter"]["overall"] == 35
-
     assert scores["recruiter"]["components"]["readme"]["score"] == 35
+
+
 def test_repository_scores_award_all_available_points():
     evidence = [
         {
@@ -157,7 +162,60 @@ def test_repository_scores_award_only_supported_criteria():
 
     assert scores["engineering"].overall == 10
     assert scores["recruiter"].overall == 45
-    assert scores["engineering"].components[
-        "repository_organization"
-    ].score == 10
+    assert (
+        scores["engineering"]
+        .components["repository_organization"]
+        .score
+        == 10
+    )
     assert scores["recruiter"].components["readme"].score == 35
+
+
+def test_recommendations_prioritize_high_severity_findings():
+    engineering_findings = [
+        {
+            "id": "ENG-001",
+            "severity": "medium",
+            "title": "Add automated tests",
+            "recommendation": "Add tests for critical application paths.",
+            "explanation": "No test files were detected.",
+        },
+    ]
+    recruiter_findings = [
+        {
+            "id": "REC-FIND-001",
+            "severity": "high",
+            "title": "Improve project documentation",
+            "recommendation": "Document setup and usage.",
+            "explanation": "The repository needs clearer setup guidance.",
+        },
+    ]
+
+    recommendations = generate_recommendations(
+        engineering_findings,
+        recruiter_findings,
+    )
+
+    assert recommendations[0]["priority"] == "high"
+    assert recommendations[0]["finding_ids"] == ["REC-FIND-001"]
+    assert recommendations[1]["priority"] == "medium"
+    assert recommendations[1]["finding_ids"] == ["ENG-001"]
+
+
+def test_recommendations_are_empty_without_findings():
+    assert generate_recommendations([], []) == []
+
+
+def test_recommendations_reject_unknown_severity():
+    findings = [
+        {
+            "id": "ENG-001",
+            "severity": "urgent",
+            "title": "Review configuration",
+            "recommendation": "Inspect the configuration.",
+            "explanation": "A review is required.",
+        },
+    ]
+
+    with pytest.raises(ValueError, match="Unsupported finding severity"):
+        generate_recommendations(findings, [])
