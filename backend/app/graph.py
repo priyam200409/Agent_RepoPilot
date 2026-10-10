@@ -9,6 +9,7 @@ from backend.app.github_loader import (
     build_repository_snapshot,
 )
 from backend.app.reviewer import review_engineering, review_recruiter
+from backend.app.schemas import ReviewScores, ScoreComponent
 
 
 class AnalysisState(TypedDict):
@@ -74,6 +75,175 @@ def recruiter_review(state: AnalysisState) -> dict:
     }
 
 
+def _has_metric(
+    evidence: list[dict],
+    category: str,
+    metric: str,
+) -> bool:
+    return any(
+        item.get("category") == category
+        and item.get("metric") == metric
+        for item in evidence
+    )
+
+
+def _has_documentation(
+    evidence: list[dict],
+    filename: str,
+) -> bool:
+    return any(
+        item.get("category") == "documentation"
+        and item.get("metric") == "documentation_file"
+        and item.get("value") == filename
+        for item in evidence
+    )
+
+
+def _build_review_scores(
+    criteria: dict[str, tuple[int, bool, str, str]],
+) -> ReviewScores:
+    components: dict[str, ScoreComponent] = {}
+
+    for name, (weight, met, positive_reason, missing_reason) in (
+        criteria.items()
+    ):
+        points = weight if met else 0
+        reason = positive_reason if met else missing_reason
+
+        components[name] = ScoreComponent(
+            score=points,
+            rationale=f"{reason} Earned {points} of {weight} possible points.",
+        )
+
+    return ReviewScores(
+        overall=sum(component.score for component in components.values()),
+        components=components,
+    )
+
+
+def calculate_repository_scores(evidence: list[dict]) -> dict[str, ReviewScores]:
+    """Calculate reproducible scores from deterministic repository evidence."""
+    file_count = next(
+        (
+            item.get("value", 0)
+            for item in evidence
+            if item.get("category") == "repository"
+            and item.get("metric") == "analyzable_file_count"
+        ),
+        0,
+    )
+
+    has_tests = _has_metric(evidence, "testing", "test_file")
+    has_ci = _has_metric(evidence, "ci_cd", "configuration_file")
+    has_dependencies = _has_metric(
+        evidence, "dependencies", "dependency_file"
+    )
+    has_container = _has_metric(
+        evidence, "containerization", "configuration_file"
+    )
+    has_readme = _has_documentation(evidence, "README.md")
+    has_additional_docs = (
+        _has_documentation(evidence, "CONTRIBUTING.md")
+        or _has_documentation(evidence, "CHANGELOG.md")
+    )
+    has_organized_repository = (
+        isinstance(file_count, int) and file_count >= 5
+    )
+
+    engineering = _build_review_scores(
+        {
+            "testing": (
+                30,
+                has_tests,
+                "Test files were detected.",
+                "No test files were detected.",
+            ),
+            "ci_cd": (
+                25,
+                has_ci,
+                "CI/CD configuration was detected.",
+                "No supported CI/CD configuration was detected.",
+            ),
+            "dependency_management": (
+                20,
+                has_dependencies,
+                "A recognized dependency manifest was detected.",
+                "No recognized dependency manifest was detected.",
+            ),
+            "containerization": (
+                15,
+                has_container,
+                "Container configuration was detected.",
+                "No supported container configuration was detected.",
+            ),
+            "repository_organization": (
+                10,
+                has_organized_repository,
+                "At least five analyzable files were detected.",
+                "Fewer than five analyzable files were detected.",
+            ),
+        }
+    )
+
+    recruiter = _build_review_scores(
+        {
+            "readme": (
+                35,
+                has_readme,
+                "README.md was detected.",
+                "README.md was not detected.",
+            ),
+            "additional_documentation": (
+                15,
+                has_additional_docs,
+                "Additional project documentation was detected.",
+                "No CONTRIBUTING.md or CHANGELOG.md was detected.",
+            ),
+            "dependency_manifest": (
+                15,
+                has_dependencies,
+                "A recognized dependency manifest was detected.",
+                "No recognized dependency manifest was detected.",
+            ),
+            "testing_visibility": (
+                15,
+                has_tests,
+                "Test files were detected.",
+                "No test files were detected.",
+            ),
+            "ci_cd_visibility": (
+                10,
+                has_ci,
+                "CI/CD configuration was detected.",
+                "No supported CI/CD configuration was detected.",
+            ),
+            "repository_organization": (
+                10,
+                has_organized_repository,
+                "At least five analyzable files were detected.",
+                "Fewer than five analyzable files were detected.",
+            ),
+        }
+    )
+
+    return {
+        "engineering": engineering,
+        "recruiter": recruiter,
+    }
+
+
+def calculate_scores(state: AnalysisState) -> dict:
+    scores = calculate_repository_scores(state["evidence"])
+
+    return {
+        "scores": {
+            name: score.model_dump(mode="json")
+            for name, score in scores.items()
+        },
+        "status": "scoring_completed",
+    }
+
+
 def build_analysis_graph():
     graph = StateGraph(AnalysisState)
 
@@ -82,13 +252,15 @@ def build_analysis_graph():
     graph.add_node("analyze_evidence", analyze_evidence)
     graph.add_node("engineering_review", engineering_review)
     graph.add_node("recruiter_review", recruiter_review)
+    graph.add_node("calculate_scores", calculate_scores)
 
     graph.add_edge(START, "initialize_analysis")
     graph.add_edge("initialize_analysis", "load_repository")
     graph.add_edge("load_repository", "analyze_evidence")
     graph.add_edge("analyze_evidence", "engineering_review")
     graph.add_edge("engineering_review", "recruiter_review")
-    graph.add_edge("recruiter_review", END)
+    graph.add_edge("recruiter_review", "calculate_scores")
+    graph.add_edge("calculate_scores", END)
 
     return graph.compile()
 

@@ -1,11 +1,14 @@
 
 from unittest.mock import patch
 
-from backend.app.graph import analysis_graph
+from backend.app.graph import (
+    analysis_graph,
+    calculate_repository_scores,
+)
 from backend.app.schemas import ReviewResult
 
 
-def test_analysis_graph_runs_both_reviewers(monkeypatch):
+def test_analysis_graph_runs_both_reviewers_and_scores(monkeypatch):
     class FakeFile:
         path = "README.md"
         size = 100
@@ -58,7 +61,7 @@ def test_analysis_graph_runs_both_reviewers(monkeypatch):
             }
         )
 
-    assert result["status"] == "recruiter_review_completed"
+    assert result["status"] == "scoring_completed"
     assert result["snapshot"].repository == "test-repo"
     assert result["evidence"]
     assert result["findings"] == []
@@ -66,3 +69,95 @@ def test_analysis_graph_runs_both_reviewers(monkeypatch):
 
     mock_engineering.assert_called_once_with(result["evidence"])
     mock_recruiter.assert_called_once_with(result["evidence"])
+
+    scores = result["scores"]
+    assert scores["engineering"]["overall"] == 0
+    assert scores["recruiter"]["overall"] == 35
+
+    assert scores["recruiter"]["components"]["readme"]["score"] == 35
+def test_repository_scores_award_all_available_points():
+    evidence = [
+        {
+            "category": "repository",
+            "metric": "analyzable_file_count",
+            "value": 10,
+        },
+        {
+            "category": "documentation",
+            "metric": "documentation_file",
+            "value": "README.md",
+        },
+        {
+            "category": "documentation",
+            "metric": "documentation_file",
+            "value": "CONTRIBUTING.md",
+        },
+        {
+            "category": "dependencies",
+            "metric": "dependency_file",
+            "value": "requirements.txt",
+        },
+        {
+            "category": "testing",
+            "metric": "test_file",
+            "value": "tests/test_app.py",
+        },
+        {
+            "category": "ci_cd",
+            "metric": "configuration_file",
+            "value": ".github/workflows/tests.yml",
+        },
+        {
+            "category": "containerization",
+            "metric": "configuration_file",
+            "value": "Dockerfile",
+        },
+    ]
+
+    scores = calculate_repository_scores(evidence)
+
+    assert scores["engineering"].overall == 100
+    assert scores["recruiter"].overall == 100
+
+    for review_score in scores.values():
+        assert review_score.overall == sum(
+            component.score
+            for component in review_score.components.values()
+        )
+
+
+def test_repository_scores_are_zero_without_evidence():
+    scores = calculate_repository_scores([])
+
+    assert scores["engineering"].overall == 0
+    assert scores["recruiter"].overall == 0
+
+    for review_score in scores.values():
+        assert all(
+            component.score == 0
+            for component in review_score.components.values()
+        )
+
+
+def test_repository_scores_award_only_supported_criteria():
+    evidence = [
+        {
+            "category": "repository",
+            "metric": "analyzable_file_count",
+            "value": 5,
+        },
+        {
+            "category": "documentation",
+            "metric": "documentation_file",
+            "value": "README.md",
+        },
+    ]
+
+    scores = calculate_repository_scores(evidence)
+
+    assert scores["engineering"].overall == 10
+    assert scores["recruiter"].overall == 45
+    assert scores["engineering"].components[
+        "repository_organization"
+    ].score == 10
+    assert scores["recruiter"].components["readme"].score == 35
