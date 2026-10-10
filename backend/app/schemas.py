@@ -1,3 +1,5 @@
+
+import json
 from enum import Enum
 from typing import Any
 
@@ -47,6 +49,20 @@ class ReviewScores(ContractModel):
     overall: int = Field(ge=0, le=100)
     components: dict[str, ScoreComponent] = Field(min_length=1)
 
+    @model_validator(mode="after")
+    def validate_component_total(self):
+        component_total = sum(
+            component.score
+            for component in self.components.values()
+        )
+
+        if component_total != self.overall:
+            raise ValueError(
+                "Overall score must equal the sum of component scores"
+            )
+
+        return self
+
 
 class Recommendation(ContractModel):
     id: str = Field(min_length=1)
@@ -62,6 +78,25 @@ class ReviewResult(ContractModel):
     findings: list[Finding]
 
 
+def _evidence_key(reference: EvidenceReference) -> tuple[str, str, str]:
+    """Build a stable key for comparing evidence references."""
+    try:
+        return (
+            reference.category,
+            reference.metric,
+            json.dumps(
+                reference.value,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ),
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "Evidence value must be JSON serializable"
+        ) from exc
+
+
 class AnalysisReport(ContractModel):
     repository_url: str = Field(min_length=1)
     repository_name: str = Field(min_length=1)
@@ -75,18 +110,49 @@ class AnalysisReport(ContractModel):
     status: str = "completed"
 
     @model_validator(mode="after")
-    def validate_recommendation_references(self):
-        finding_ids = {
-            finding.id
-            for review in (
-                self.engineering_review,
-                self.recruiter_review,
+    def validate_report_consistency(self):
+        expected_overall = (
+            self.engineering_scores.overall
+            + self.recruiter_scores.overall
+            + 1
+        ) // 2
+
+        if self.overall_score != expected_overall:
+            raise ValueError(
+                "Overall report score must equal the rounded average "
+                "of engineering and recruiter scores"
             )
-            for finding in review.findings
+
+        finding_ids = set()
+        report_evidence_keys = {
+            _evidence_key(reference)
+            for reference in self.evidence
         }
 
+        for review in (
+            self.engineering_review,
+            self.recruiter_review,
+        ):
+            for finding in review.findings:
+                if finding.id in finding_ids:
+                    raise ValueError(
+                        f"Duplicate finding ID: {finding.id}"
+                    )
+
+                finding_ids.add(finding.id)
+
+                for reference in finding.evidence:
+                    if _evidence_key(reference) not in report_evidence_keys:
+                        raise ValueError(
+                            "Finding references evidence not included "
+                            f"in the report: {finding.id}"
+                        )
+
         for recommendation in self.recommendations:
-            unknown_ids = set(recommendation.finding_ids) - finding_ids
+            unknown_ids = (
+                set(recommendation.finding_ids) - finding_ids
+            )
+
             if unknown_ids:
                 raise ValueError(
                     "Recommendation references unknown finding IDs: "
