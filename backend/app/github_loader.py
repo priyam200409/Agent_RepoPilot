@@ -3,7 +3,7 @@ import base64
 import binascii
 from dataclasses import dataclass
 from pathlib import PurePosixPath
-from urllib.parse import unquote, urlparse
+from urllib.parse import quote, urlparse
 
 import httpx
 
@@ -51,19 +51,19 @@ def parse_github_url(repository_url: str) -> tuple[str, str]:
     except ValueError as exc:
         raise ValueError("URL must be a valid GitHub URL") from exc
 
+    hostname = (parsed.hostname or "").lower()
+
     if (
         parsed.scheme not in {"http", "https"}
-        or parsed.hostname != "github.com"
+        or hostname not in {"github.com", "www.github.com"}
         or parsed.username is not None
         or parsed.password is not None
         or port is not None
         or parsed.query
         or parsed.fragment
+        or parsed.netloc.lower() not in {"github.com", "www.github.com"}
     ):
         raise ValueError("URL must be a valid GitHub URL")
-
-    if parsed.netloc.lower() not in {"github.com", "www.github.com"}:
-        raise ValueError("URL must use github.com")
 
     raw_path = parsed.path.strip("/")
     parts = raw_path.split("/")
@@ -85,7 +85,6 @@ def parse_github_url(repository_url: str) -> tuple[str, str]:
     if not owner or not repository:
         raise ValueError("URL must point to a GitHub repository")
 
-    # GitHub owner and repository names cannot contain URL separators.
     valid_chars = set(
         "abcdefghijklmnopqrstuvwxyz"
         "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
@@ -104,6 +103,7 @@ def parse_github_url(repository_url: str) -> tuple[str, str]:
 
 
 def fetch_repository_metadata(owner: str, repository: str) -> dict:
+    """Fetch and validate repository metadata from GitHub."""
     url = f"{API_BASE_URL}/repos/{owner}/{repository}"
 
     response = httpx.get(
@@ -117,16 +117,33 @@ def fetch_repository_metadata(owner: str, repository: str) -> dict:
         raise ValueError("GitHub repository not found")
 
     response.raise_for_status()
-    data = response.json()
 
     try:
-        return {
-            "owner": data["owner"]["login"],
-            "repository": data["name"],
-            "default_branch": data["default_branch"],
-        }
+        data = response.json()
+    except ValueError as exc:
+        raise ValueError("Invalid repository metadata response from GitHub") from exc
+
+    if not isinstance(data, dict):
+        raise ValueError("Invalid repository metadata from GitHub")
+
+    try:
+        repository_owner = data["owner"]["login"]
+        repository_name = data["name"]
+        default_branch = data["default_branch"]
     except (KeyError, TypeError) as exc:
         raise ValueError("Invalid repository metadata from GitHub") from exc
+
+    if not all(
+        isinstance(value, str) and value
+        for value in (repository_owner, repository_name, default_branch)
+    ):
+        raise ValueError("Invalid repository metadata from GitHub")
+
+    return {
+        "owner": repository_owner,
+        "repository": repository_name,
+        "default_branch": default_branch,
+    }
 
 
 def fetch_repository_tree(
@@ -134,9 +151,7 @@ def fetch_repository_tree(
     repository: str,
     branch: str,
 ) -> list[dict]:
-    # The branch is URL-encoded so special characters cannot alter the URL.
-    from urllib.parse import quote
-
+    """Fetch the recursive Git tree while enforcing the file-count limit."""
     encoded_branch = quote(branch, safe="")
     url = (
         f"{API_BASE_URL}/repos/{owner}/{repository}"
@@ -151,7 +166,14 @@ def fetch_repository_tree(
     )
 
     response.raise_for_status()
-    data = response.json()
+
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise ValueError("Invalid repository tree response from GitHub") from exc
+
+    if not isinstance(data, dict):
+        raise ValueError("Invalid repository tree response from GitHub")
 
     if data.get("truncated"):
         raise ValueError("Repository tree is too large to analyze safely")
@@ -174,6 +196,7 @@ def fetch_repository_tree(
 
 
 def is_text_file(file_path: str) -> bool:
+    """Return whether a path uses a supported text-file format."""
     path = PurePosixPath(file_path)
 
     if path.name in {"Dockerfile", "Makefile"}:
@@ -183,10 +206,12 @@ def is_text_file(file_path: str) -> bool:
 
 
 def filter_analyzable_files(files: list[dict]) -> list[dict]:
+    """Keep supported text files within the per-file size limit."""
     return [
         file
         for file in files
-        if isinstance(file.get("path"), str)
+        if isinstance(file, dict)
+        and isinstance(file.get("path"), str)
         and isinstance(file.get("size"), int)
         and not isinstance(file.get("size"), bool)
         and 0 <= file["size"] <= MAX_FILE_SIZE
@@ -199,13 +224,13 @@ def fetch_file_content(
     repository: str,
     file_path: str,
 ) -> str:
-    """Fetch and decode a bounded UTF-8 file from the GitHub contents API."""
+    """Fetch and strictly decode a bounded UTF-8 file from GitHub."""
     if not isinstance(file_path, str) or not file_path:
         raise ValueError("File path must not be empty")
 
     url = (
         f"{API_BASE_URL}/repos/{owner}/{repository}"
-        f"/contents/{file_path}"
+        f"/contents/{quote(file_path, safe='/')}"
     )
 
     response = httpx.get(
@@ -216,7 +241,14 @@ def fetch_file_content(
     )
 
     response.raise_for_status()
-    data = response.json()
+
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise ValueError(f"Invalid file content response: {file_path}") from exc
+
+    if not isinstance(data, dict):
+        raise ValueError(f"Invalid file content response: {file_path}")
 
     if data.get("encoding") != "base64":
         raise ValueError(f"Unsupported encoding: {file_path}")
@@ -226,19 +258,26 @@ def fetch_file_content(
     if not isinstance(encoded_content, str):
         raise ValueError(f"Invalid file content response: {file_path}")
 
-    # Reject an oversized encoded response before decoding it.
-    max_encoded_size = 4 * ((MAX_FILE_SIZE + 2) // 3) + 16
+    # GitHub Base64 content may contain whitespace and line breaks.
+    normalized_content = "".join(encoded_content.split())
 
-    if len(encoded_content) > max_encoded_size:
-        raise ValueError(f"File exceeds the {MAX_FILE_SIZE}-byte limit: {file_path}")
+    # Check encoded size before decoding.
+    max_encoded_size = 4 * ((MAX_FILE_SIZE + 2) // 3)
+
+    if len(normalized_content) > max_encoded_size:
+        raise ValueError(
+            f"File exceeds the {MAX_FILE_SIZE}-byte limit: {file_path}"
+        )
 
     try:
-        decoded = base64.b64decode(encoded_content, validate=False)
+        decoded = base64.b64decode(normalized_content, validate=True)
     except (binascii.Error, ValueError) as exc:
         raise ValueError(f"Invalid Base64 content: {file_path}") from exc
 
     if len(decoded) > MAX_FILE_SIZE:
-        raise ValueError(f"File exceeds the {MAX_FILE_SIZE}-byte limit: {file_path}")
+        raise ValueError(
+            f"File exceeds the {MAX_FILE_SIZE}-byte limit: {file_path}"
+        )
 
     try:
         return decoded.decode("utf-8")
@@ -247,6 +286,7 @@ def fetch_file_content(
 
 
 def build_repository_snapshot(repository_url: str) -> RepositorySnapshot:
+    """Build a bounded snapshot containing analyzable repository files."""
     owner, repository = parse_github_url(repository_url)
     metadata = fetch_repository_metadata(owner, repository)
 
