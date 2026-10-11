@@ -1,5 +1,6 @@
 
 import base64
+from contextlib import contextmanager
 
 import httpx
 import pytest
@@ -7,11 +8,60 @@ import pytest
 import backend.app.github_loader as loader
 from backend.app.github_loader import (
     MAX_FILE_SIZE,
+    MAX_FILE_RESPONSE_SIZE,
+    MAX_METADATA_RESPONSE_SIZE,
+    MAX_TREE_RESPONSE_SIZE,
+    fetch_file_content,
     filter_analyzable_files,
     is_text_file,
     parse_github_url,
-    fetch_file_content,
 )
+
+
+class FakeStreamResponse:
+    def __init__(
+        self,
+        body=b"",
+        *,
+        status_code=200,
+        headers=None,
+        chunks=None,
+    ):
+        self.status_code = status_code
+        self.headers = headers or {}
+        self.request = httpx.Request(
+            "GET", "https://api.github.com/test"
+        )
+        self._body = body
+        self._chunks = chunks if chunks is not None else [body]
+
+    def raise_for_status(self):
+        response = httpx.Response(
+            self.status_code,
+            headers=self.headers,
+            request=self.request,
+        )
+        response.raise_for_status()
+
+    def iter_bytes(self):
+        yield from self._chunks
+
+
+def install_stream_mock(monkeypatch, response):
+    @contextmanager
+    def fake_stream(*args, **kwargs):
+        yield response
+
+    monkeypatch.setattr(loader.httpx, "stream", fake_stream)
+
+
+def make_json_response(data):
+    import json
+
+    return FakeStreamResponse(
+        json.dumps(data).encode("utf-8"),
+        headers={"content-type": "application/json"},
+    )
 
 
 def test_parse_github_url():
@@ -46,6 +96,12 @@ def test_parse_github_url_rejects_invalid_urls(url):
         parse_github_url(url)
 
 
+def test_parse_github_url_accepts_www_hostname():
+    assert parse_github_url(
+        "https://www.github.com/owner/repo"
+    ) == ("owner", "repo")
+
+
 def test_is_text_file():
     assert is_text_file("backend/app/main.py")
     assert is_text_file("Dockerfile")
@@ -75,6 +131,7 @@ def test_filter_analyzable_files_rejects_invalid_metadata():
         {"path": "unknown.py"},
         {"path": "string.py", "size": "100"},
         {"path": "boolean.py", "size": True},
+        None,
     ]
 
     result = filter_analyzable_files(files)
@@ -89,35 +146,23 @@ def test_filter_analyzable_files_accepts_maximum_file_size():
 
 
 def test_fetch_file_content_rejects_invalid_base64(monkeypatch):
-    class FakeResponse:
-        def raise_for_status(self):
-            pass
-
-        def json(self):
-            return {"encoding": "base64", "content": "%%%invalid%%%"}
-
-    monkeypatch.setattr(
-        loader.httpx, "get", lambda *args, **kwargs: FakeResponse()
+    response = make_json_response(
+        {"encoding": "base64", "content": "%%%invalid%%%"}
     )
+    install_stream_mock(monkeypatch, response)
 
     with pytest.raises(ValueError, match="Invalid Base64"):
         fetch_file_content("owner", "repo", "main.py")
 
 
 def test_fetch_file_content_rejects_non_utf8(monkeypatch):
-    class FakeResponse:
-        def raise_for_status(self):
-            pass
-
-        def json(self):
-            return {
-                "encoding": "base64",
-                "content": base64.b64encode(b"\xff").decode(),
-            }
-
-    monkeypatch.setattr(
-        loader.httpx, "get", lambda *args, **kwargs: FakeResponse()
+    response = make_json_response(
+        {
+            "encoding": "base64",
+            "content": base64.b64encode(b"\xff").decode(),
+        }
     )
+    install_stream_mock(monkeypatch, response)
 
     with pytest.raises(ValueError, match="valid UTF-8"):
         fetch_file_content("owner", "repo", "main.py")
@@ -125,77 +170,127 @@ def test_fetch_file_content_rejects_non_utf8(monkeypatch):
 
 def test_fetch_file_content_rejects_oversized_content(monkeypatch):
     oversized = b"a" * (MAX_FILE_SIZE + 1)
-
-    class FakeResponse:
-        def raise_for_status(self):
-            pass
-
-        def json(self):
-            return {
-                "encoding": "base64",
-                "content": base64.b64encode(oversized).decode(),
-            }
-
-    monkeypatch.setattr(
-        loader.httpx, "get", lambda *args, **kwargs: FakeResponse()
+    response = make_json_response(
+        {
+            "encoding": "base64",
+            "content": base64.b64encode(oversized).decode(),
+        }
     )
+    install_stream_mock(monkeypatch, response)
 
     with pytest.raises(ValueError, match="exceeds"):
         fetch_file_content("owner", "repo", "main.py")
 
 
-def test_fetch_file_content_propagates_http_error(monkeypatch):
-    def fake_get(*args, **kwargs):
-        request = httpx.Request("GET", "https://api.github.com/test")
-        response = httpx.Response(403, request=request)
-        response.raise_for_status()
+def test_fetch_file_content_accepts_valid_base64_with_whitespace(
+    monkeypatch,
+):
+    response = make_json_response(
+        {
+            "encoding": "base64",
+            "content": "aGVs\nbG8=\n",
+        }
+    )
+    install_stream_mock(monkeypatch, response)
 
-    monkeypatch.setattr(loader.httpx, "get", fake_get)
+    assert fetch_file_content("owner", "repo", "main.py") == "hello"
+
+
+def test_fetch_file_content_propagates_http_error(monkeypatch):
+    response = FakeStreamResponse(status_code=403)
+    install_stream_mock(monkeypatch, response)
 
     with pytest.raises(httpx.HTTPStatusError):
         fetch_file_content("owner", "repo", "main.py")
 
 
 def test_repository_tree_rejects_truncated_response(monkeypatch):
-    class FakeResponse:
-        def raise_for_status(self):
-            pass
-
-        def json(self):
-            return {"truncated": True, "tree": []}
-
-    monkeypatch.setattr(
-        loader.httpx, "get", lambda *args, **kwargs: FakeResponse()
+    response = make_json_response(
+        {"truncated": True, "tree": []}
     )
+    install_stream_mock(monkeypatch, response)
 
     with pytest.raises(ValueError, match="too large"):
         loader.fetch_repository_tree("owner", "repo", "main")
 
 
 def test_repository_tree_rejects_file_limit(monkeypatch):
-    class FakeResponse:
-        def raise_for_status(self):
-            pass
-
-        def json(self):
-            return {
-                "truncated": False,
-                "tree": [
-                    {
-                        "type": "blob",
-                        "path": f"file{i}.py",
-                        "size": 1,
-                    }
-                    for i in range(loader.MAX_FILES + 1)
-                ],
-            }
-
-    monkeypatch.setattr(
-        loader.httpx, "get", lambda *args, **kwargs: FakeResponse()
+    response = make_json_response(
+        {
+            "truncated": False,
+            "tree": [
+                {
+                    "type": "blob",
+                    "path": f"file{i}.py",
+                    "size": 1,
+                }
+                for i in range(loader.MAX_FILES + 1)
+            ],
+        }
     )
+    install_stream_mock(monkeypatch, response)
 
     with pytest.raises(ValueError, match="file limit"):
         loader.fetch_repository_tree("owner", "repo", "main")
+
+
+def test_bounded_response_rejects_oversized_content_length(
+    monkeypatch,
+):
+    response = FakeStreamResponse(
+        b"",
+        headers={"content-length": str(MAX_METADATA_RESPONSE_SIZE + 1)},
+    )
+    install_stream_mock(monkeypatch, response)
+
+    with pytest.raises(ValueError, match="size limit"):
+        loader.get_bounded_response(
+            "https://api.github.com/test",
+            max_response_size=MAX_METADATA_RESPONSE_SIZE,
+            timeout=10,
+        )
+
+
+@pytest.mark.parametrize(
+    ("limit", "constant"),
+    [
+        (MAX_METADATA_RESPONSE_SIZE, MAX_METADATA_RESPONSE_SIZE),
+        (MAX_TREE_RESPONSE_SIZE, MAX_TREE_RESPONSE_SIZE),
+        (MAX_FILE_RESPONSE_SIZE, MAX_FILE_RESPONSE_SIZE),
+    ],
+)
+def test_response_limits_are_positive_and_configured(limit, constant):
+    assert limit == constant
+    assert limit > 0
+
+
+def test_bounded_response_rejects_oversized_stream_without_length(
+    monkeypatch,
+):
+    response = FakeStreamResponse(
+        chunks=[b"a" * 8, b"b" * 8],
+    )
+    install_stream_mock(monkeypatch, response)
+
+    with pytest.raises(ValueError, match="size limit"):
+        loader.get_bounded_response(
+            "https://api.github.com/test",
+            max_response_size=10,
+            timeout=10,
+        )
+
+
+def test_bounded_response_accepts_body_within_limit(monkeypatch):
+    response = FakeStreamResponse(chunks=[b"hello", b" world"])
+    install_stream_mock(monkeypatch, response)
+
+    result = loader.get_bounded_response(
+        "https://api.github.com/test",
+        max_response_size=20,
+        timeout=10,
+    )
+
+    assert result.content == b"hello world"
 
 
 def test_build_snapshot_rejects_total_content_limit(monkeypatch):

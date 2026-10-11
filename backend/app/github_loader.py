@@ -12,6 +12,10 @@ MAX_FILES = 200
 MAX_FILE_SIZE = 100 * 1024
 MAX_TOTAL_CONTENT_SIZE = 2 * 1024 * 1024
 
+MAX_METADATA_RESPONSE_SIZE = 256 * 1024
+MAX_TREE_RESPONSE_SIZE = 2 * 1024 * 1024
+MAX_FILE_RESPONSE_SIZE = 256 * 1024
+
 API_BASE_URL = "https://api.github.com"
 API_HEADERS = {"Accept": "application/vnd.github+json"}
 
@@ -40,6 +44,56 @@ class RepositorySnapshot:
     files: list[RepositoryFile]
 
 
+def get_bounded_response(
+    url: str,
+    *,
+    max_response_size: int,
+    timeout: int,
+) -> httpx.Response:
+    """Fetch an HTTP response while enforcing a body-size limit."""
+    if max_response_size <= 0:
+        raise ValueError("Response-size limit must be positive")
+
+    with httpx.stream(
+        "GET",
+        url,
+        headers=API_HEADERS,
+        timeout=timeout,
+        follow_redirects=False,
+    ) as response:
+        response.raise_for_status()
+
+        content_length = response.headers.get("content-length")
+
+        if content_length is not None:
+            try:
+                declared_size = int(content_length)
+            except ValueError as exc:
+                raise ValueError("Invalid HTTP Content-Length header") from exc
+
+            if declared_size < 0 or declared_size > max_response_size:
+                raise ValueError(
+                    "GitHub response exceeds the permitted size limit"
+                )
+
+        body = bytearray()
+
+        for chunk in response.iter_bytes():
+            if len(body) + len(chunk) > max_response_size:
+                raise ValueError(
+                    "GitHub response exceeds the permitted size limit"
+                )
+
+            body.extend(chunk)
+
+        return httpx.Response(
+            status_code=response.status_code,
+            headers=response.headers,
+            content=bytes(body),
+            request=response.request,
+        )
+
+
 def parse_github_url(repository_url: str) -> tuple[str, str]:
     """Validate a public GitHub repository URL and return owner/repository."""
     if not isinstance(repository_url, str) or not repository_url:
@@ -65,14 +119,13 @@ def parse_github_url(repository_url: str) -> tuple[str, str]:
     ):
         raise ValueError("URL must be a valid GitHub URL")
 
-    raw_path = parsed.path.strip("/")
-    parts = raw_path.split("/")
+    parts = parsed.path.strip("/").split("/")
 
     if (
         len(parts) != 2
         or not all(parts)
-        or "%" in raw_path
-        or "\\" in raw_path
+        or "%" in parsed.path
+        or "\\" in parsed.path
         or any(part in {".", ".."} for part in parts)
     ):
         raise ValueError("URL must point to a GitHub repository")
@@ -82,9 +135,6 @@ def parse_github_url(repository_url: str) -> tuple[str, str]:
     if repository.endswith(".git"):
         repository = repository[:-4]
 
-    if not owner or not repository:
-        raise ValueError("URL must point to a GitHub repository")
-
     valid_chars = set(
         "abcdefghijklmnopqrstuvwxyz"
         "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
@@ -92,7 +142,9 @@ def parse_github_url(repository_url: str) -> tuple[str, str]:
     )
 
     if (
-        not set(owner) <= valid_chars
+        not owner
+        or not repository
+        or not set(owner) <= valid_chars
         or not set(repository) <= valid_chars
         or owner in {".", ".."}
         or repository in {".", ".."}
@@ -106,22 +158,21 @@ def fetch_repository_metadata(owner: str, repository: str) -> dict:
     """Fetch and validate repository metadata from GitHub."""
     url = f"{API_BASE_URL}/repos/{owner}/{repository}"
 
-    response = httpx.get(
+    response = get_bounded_response(
         url,
-        headers=API_HEADERS,
+        max_response_size=MAX_METADATA_RESPONSE_SIZE,
         timeout=10,
-        follow_redirects=False,
     )
 
     if response.status_code == 404:
         raise ValueError("GitHub repository not found")
 
-    response.raise_for_status()
-
     try:
         data = response.json()
     except ValueError as exc:
-        raise ValueError("Invalid repository metadata response from GitHub") from exc
+        raise ValueError(
+            "Invalid repository metadata response from GitHub"
+        ) from exc
 
     if not isinstance(data, dict):
         raise ValueError("Invalid repository metadata from GitHub")
@@ -158,14 +209,11 @@ def fetch_repository_tree(
         f"/git/trees/{encoded_branch}?recursive=1"
     )
 
-    response = httpx.get(
+    response = get_bounded_response(
         url,
-        headers=API_HEADERS,
+        max_response_size=MAX_TREE_RESPONSE_SIZE,
         timeout=15,
-        follow_redirects=False,
     )
-
-    response.raise_for_status()
 
     try:
         data = response.json()
@@ -233,14 +281,11 @@ def fetch_file_content(
         f"/contents/{quote(file_path, safe='/')}"
     )
 
-    response = httpx.get(
+    response = get_bounded_response(
         url,
-        headers=API_HEADERS,
+        max_response_size=MAX_FILE_RESPONSE_SIZE,
         timeout=10,
-        follow_redirects=False,
     )
-
-    response.raise_for_status()
 
     try:
         data = response.json()
@@ -258,10 +303,7 @@ def fetch_file_content(
     if not isinstance(encoded_content, str):
         raise ValueError(f"Invalid file content response: {file_path}")
 
-    # GitHub Base64 content may contain whitespace and line breaks.
     normalized_content = "".join(encoded_content.split())
-
-    # Check encoded size before decoding.
     max_encoded_size = 4 * ((MAX_FILE_SIZE + 2) // 3)
 
     if len(normalized_content) > max_encoded_size:
