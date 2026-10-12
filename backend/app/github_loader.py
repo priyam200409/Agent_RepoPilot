@@ -69,7 +69,9 @@ def get_bounded_response(
             try:
                 declared_size = int(content_length)
             except ValueError as exc:
-                raise ValueError("Invalid HTTP Content-Length header") from exc
+                raise ValueError(
+                    "Invalid HTTP Content-Length header"
+                ) from exc
 
             if declared_size < 0 or declared_size > max_response_size:
                 raise ValueError(
@@ -86,12 +88,22 @@ def get_bounded_response(
 
             body.extend(chunk)
 
-        return httpx.Response(
-            status_code=response.status_code,
-            headers=response.headers,
-            content=bytes(body),
-            request=response.request,
-        )
+        status_code = response.status_code
+        headers = response.headers.copy()
+        request = response.request
+
+    # The body contains decoded bytes. Remove headers describing the
+    # original encoded or transferred response before rebuilding it.
+    headers.pop("content-encoding", None)
+    headers.pop("content-length", None)
+    headers.pop("transfer-encoding", None)
+
+    return httpx.Response(
+        status_code=status_code,
+        headers=headers,
+        content=bytes(body),
+        request=request,
+    )
 
 
 def parse_github_url(repository_url: str) -> tuple[str, str]:
@@ -182,11 +194,17 @@ def fetch_repository_metadata(owner: str, repository: str) -> dict:
         repository_name = data["name"]
         default_branch = data["default_branch"]
     except (KeyError, TypeError) as exc:
-        raise ValueError("Invalid repository metadata from GitHub") from exc
+        raise ValueError(
+            "Invalid repository metadata from GitHub"
+        ) from exc
 
     if not all(
         isinstance(value, str) and value
-        for value in (repository_owner, repository_name, default_branch)
+        for value in (
+            repository_owner,
+            repository_name,
+            default_branch,
+        )
     ):
         raise ValueError("Invalid repository metadata from GitHub")
 
@@ -218,7 +236,9 @@ def fetch_repository_tree(
     try:
         data = response.json()
     except ValueError as exc:
-        raise ValueError("Invalid repository tree response from GitHub") from exc
+        raise ValueError(
+            "Invalid repository tree response from GitHub"
+        ) from exc
 
     if not isinstance(data, dict):
         raise ValueError("Invalid repository tree response from GitHub")
@@ -290,7 +310,9 @@ def fetch_file_content(
     try:
         data = response.json()
     except ValueError as exc:
-        raise ValueError(f"Invalid file content response: {file_path}") from exc
+        raise ValueError(
+            f"Invalid file content response: {file_path}"
+        ) from exc
 
     if not isinstance(data, dict):
         raise ValueError(f"Invalid file content response: {file_path}")
@@ -314,7 +336,9 @@ def fetch_file_content(
     try:
         decoded = base64.b64decode(normalized_content, validate=True)
     except (binascii.Error, ValueError) as exc:
-        raise ValueError(f"Invalid Base64 content: {file_path}") from exc
+        raise ValueError(
+            f"Invalid Base64 content: {file_path}"
+        ) from exc
 
     if len(decoded) > MAX_FILE_SIZE:
         raise ValueError(
@@ -324,7 +348,9 @@ def fetch_file_content(
     try:
         return decoded.decode("utf-8")
     except UnicodeDecodeError as exc:
-        raise ValueError(f"File is not valid UTF-8: {file_path}") from exc
+        raise ValueError(
+            f"File is not valid UTF-8: {file_path}"
+        ) from exc
 
 
 def build_repository_snapshot(repository_url: str) -> RepositorySnapshot:
@@ -369,6 +395,7 @@ def build_repository_snapshot(repository_url: str) -> RepositorySnapshot:
                 content=content,
             )
         )
+
         total_content_size += actual_size
 
     return RepositorySnapshot(
