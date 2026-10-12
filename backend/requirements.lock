@@ -114,7 +114,7 @@ pydantic-core==2.50.1
     # via pydantic
 pygments==2.21.0
     # via pytest
-pytest==8.4.2
+pytest==9.0.3
     # via -r backend/requirements.in
 python-dotenv==1.2.4
     # via
